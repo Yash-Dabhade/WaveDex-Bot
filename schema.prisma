@@ -1,0 +1,85 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider             = "prisma-client-py"
+  interface            = "asyncio"
+  recursive_type_depth = 5
+}
+
+model User {
+  id                String         @id @default(uuid())
+  telegramId        BigInt        @unique
+  username          String?
+  firstName         String?
+  lastName          String?
+  subscriptionTier  String        @default("free")
+  notificationSettings Json        @default("{}")
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+  alerts            Alert[]
+  subscriptions     Subscription[]
+  portfolio         Portfolio[]
+}
+
+model Alert {
+  id              String    @id @default(uuid())
+  userId          String
+  symbol          String
+  priceThreshold  Float
+  condition       String    // "above" or "below"
+  isActive        Boolean   @default(true)
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  user            User      @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@index([symbol])
+}
+
+model Subscription {
+  id              String    @id @default(uuid())
+  userId          String
+  symbol          String
+  newsEnabled     Boolean   @default(true)
+  priceAlerts     Boolean   @default(true)
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  user            User      @relation(fields: [userId], references: [id])
+
+  @@unique([userId, symbol])
+  @@index([userId])
+  @@index([symbol])
+}
+
+model Portfolio {
+  id              String    @id @default(uuid())
+  userId          String
+  symbol          String
+  quantity        Float
+  averagePrice    Float
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  user            User      @relation(fields: [userId], references: [id])
+
+  @@unique([userId, symbol])
+  @@index([userId])
+  @@index([symbol])
+}
+
+model NewsCache {
+  id              String    @id @default(uuid())
+  symbol          String
+  title           String
+  content         String
+  source          String
+  url             String
+  sentiment       Float?
+  publishedAt     DateTime
+  createdAt       DateTime  @default(now())
+
+  @@index([symbol])
+  @@index([publishedAt])
+} 
