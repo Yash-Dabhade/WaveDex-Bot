@@ -6,7 +6,7 @@ import aiohttp
 
 from app.core.config import settings
 from app.models.schemas import NewsItem
-from app.services.redis_service import RedisService
+from app.services.cache_service import CacheService
 
 class NewsService:
     _instance: Optional['NewsService'] = None
@@ -24,7 +24,7 @@ class NewsService:
         if not self._initialized:
             self.news_api_key = settings.NEWS_API_KEY
             self.cryptopanic_api_key = settings.CRYPTOPANIC_API_KEY
-            self.redis = RedisService()
+            self.cache = CacheService()
             
             # Initialize HTTP clients
             self.news_api_client = httpx.AsyncClient(
@@ -192,7 +192,7 @@ class NewsService:
         cache_key = "news:trending"
         
         # Try to get from cache
-        cached_news = await self.redis.get_key(cache_key)
+        cached_news = await self.cache.get_key(cache_key)
         if cached_news:
             return [NewsItem(**item) for item in cached_news]
 
@@ -222,7 +222,7 @@ class NewsService:
             ]
 
             # Cache the results
-            await self.redis.set_key(
+            await self.cache.set_key(
                 cache_key,
                 [news.dict() for news in trending_news],
                 expiry=self.NEWS_CACHE_TTL

@@ -7,8 +7,7 @@ import time
 
 from app.services.prisma_service import prisma_service
 from app.services.coingecko_service import coingecko_service
-from app.services.redis_service import RedisService
-from app.core.telegram import bot_instance
+from app.services.cache_service import CacheService
 from app.models.schemas import Alert, AlertCondition, MarketData
 from app.services.price_service import price_service
 from app.services.notification_service import notification_service
@@ -26,7 +25,7 @@ class AlertService:
 
     def __init__(self):
         if not self._initialized:
-            self.redis = RedisService()
+            self.cache = CacheService()
             self._initialized = True
             self._running = False
             self._task: Optional[asyncio.Task] = None
@@ -123,7 +122,7 @@ class AlertService:
         cache_key = f"price:{symbol.lower()}"
 
         # Try to get from cache
-        cached_data = await self.redis.get_key(cache_key)
+        cached_data = await self.cache.get_key(cache_key)
         if cached_data:
             return MarketData(**cached_data)
 
@@ -131,7 +130,7 @@ class AlertService:
         market_data = await coingecko_service.get_price(symbol)
         if market_data:
             # Cache the result
-            await self.redis.set_key(
+            await self.cache.set_key(
                 cache_key,
                 market_data.dict(),
                 expiry=self.PRICE_CACHE_TTL
@@ -153,11 +152,10 @@ class AlertService:
             )
 
             # Send notification
-            if bot_instance.bot:
-                await bot_instance.bot.send_message(
-                    chat_id=alert.user.telegramId,
-                    text=message
-                )
+            await notification_service.send_message(
+                chat_id=alert.user.telegramId,
+                text=message
+            )
 
             # Deactivate alert
             async with prisma_service.get_connection() as db:
@@ -189,15 +187,20 @@ class AlertService:
         """Get all active alerts for a user"""
         try:
             user_alerts_key = f"{self._user_alerts_key_prefix}{user_id}"
-            alert_ids = await self.redis.smembers(user_alerts_key)
+            alert_ids = await self.cache.smembers(user_alerts_key)
 
             alerts = []
             for alert_id in alert_ids:
                 alert_key = f"{self._alert_key_prefix}{alert_id}"
-                alert_data = await self.redis.get(alert_key)
+                alert_data = await self.cache.get_key(alert_key)
                 
                 if alert_data:
-                    alerts.append(json.loads(alert_data))
+                    alert = alert_data
+                    # Get current price
+                    price_data = await price_service.get_price(alert["symbol"])
+                    if "error" not in price_data:
+                        alert["current_price"] = price_data["price_usd"]
+                    alerts.append(alert)
 
             return sorted(alerts, key=lambda x: x["created_at"], reverse=True)
 
@@ -212,81 +215,75 @@ class AlertService:
             user_alerts_key = f"{self._user_alerts_key_prefix}{user_id}"
 
             # Check if alert exists and belongs to user
-            alert_data = await self.redis.get(alert_key)
-            if not alert_data:
+            alert = await self.cache.get_key(alert_key)
+            if not alert:
                 return {"error": "Alert not found"}
-
-            alert = json.loads(alert_data)
             if alert["user_id"] != user_id:
                 return {"error": "Alert not found"}
 
             # Delete alert
-            await self.redis.delete(alert_key)
-            await self.redis.srem(user_alerts_key, alert_id)
+            await self.cache.delete_key(alert_key)
+            await self.cache.srem(user_alerts_key, alert_id)
 
             return {
                 "success": True,
-                "message": f"Alert for {alert['symbol']} deleted successfully"
+                "message": f"✅ Alert for {alert['symbol']} deleted successfully"
             }
 
         except Exception as e:
             logger.error(f"Error deleting alert: {e}")
             return {"error": "Failed to delete alert"}
 
-    async def check_alerts(self):
-        """Check all alerts against current prices"""
+    async def check_alerts(self) -> List[Dict[str, Any]]:
+        """Check all alerts against current prices and return triggered alerts"""
         try:
+            triggered_alerts = []
             # Get all user alert keys
-            user_keys = await self.redis.keys(f"{self._user_alerts_key_prefix}*")
+            user_keys = await self.cache.scan_keys(f"{self._user_alerts_key_prefix}*")
             
             for user_key in user_keys:
-                alert_ids = await self.redis.smembers(user_key)
+                alert_ids = await self.cache.smembers(user_key)
                 user_id = int(user_key.split(":")[-1])
                 
                 for alert_id in alert_ids:
                     alert_key = f"{self._alert_key_prefix}{alert_id}"
-                    alert_data = await self.redis.get(alert_key)
+                    alert_data = await self.cache.get_key(alert_key)
                     
                     if alert_data:
-                        alert = json.loads(alert_data)
-                        await self._check_alert(user_id, alert)
+                        alert = alert_data
+                        if await self._check_alert(alert):
+                            triggered_alerts.append(alert)
+                            # Delete triggered alert
+                            await self.delete_alert(user_id, alert_id)
+
+            return triggered_alerts
 
         except Exception as e:
             logger.error(f"Error checking alerts: {e}")
+            return []
 
-    async def _check_alert(self, user_id: int, alert: Dict[str, Any]):
-        """Check a single alert and notify if triggered"""
+    async def _check_alert(self, alert: Dict[str, Any]) -> bool:
+        """Check if an alert should be triggered"""
         try:
             price_data = await price_service.get_price(alert["symbol"])
             if "error" in price_data:
-                return
+                return False
 
             current_price = price_data["price_usd"]
             target_price = alert["target_price"]
             condition = alert["condition"]
 
-            is_triggered = (
+            alert["current_price"] = current_price
+            alert["price_data"] = price_data
+
+            return (
                 (condition == "above" and current_price >= target_price) or
                 (condition == "below" and current_price <= target_price)
             )
 
-            if is_triggered:
-                # Format notification message
-                message = (
-                    f"🚨 Price Alert for {alert['symbol']}!\n\n"
-                    f"Target: ${target_price:,.2f} {condition}\n"
-                    f"Current Price: ${current_price:,.2f}\n"
-                    f"24h Change: {price_data['change_24h']:+.2f}%"
-                )
-
-                # Send notification
-                await notification_service.send_message(user_id, message)
-
-                # Delete the triggered alert
-                await self.delete_alert(user_id, alert["id"])
-
         except Exception as e:
             logger.error(f"Error checking alert {alert['id']}: {e}")
+            return False
 
     async def set_alert(self, user_id: int, symbol: str, target_price: float, condition: str) -> Dict[str, Any]:
         """Set a price alert for a user"""
@@ -312,19 +309,19 @@ class AlertService:
                 "created_at": int(time.time())
             }
 
-            # Save alert in Redis
+            # Save alert in cache
             alert_key = f"{self._alert_key_prefix}{alert_id}"
             user_alerts_key = f"{self._user_alerts_key_prefix}{user_id}"
 
             # Store alert data and add to user's alert list
-            await self.redis.set(alert_key, json.dumps(alert_data))
-            await self.redis.sadd(user_alerts_key, alert_id)
+            await self.cache.set_key(alert_key, alert_data)
+            await self.cache.sadd(user_alerts_key, alert_id)
 
             return {
                 "success": True,
                 "message": (
-                    f"Alert set for {symbol.upper()} when price goes "
-                    f"{condition} ${target_price:,.2f}\n"
+                    f"✅ Alert set for {symbol.upper()}\n"
+                    f"Target: ${target_price:,.2f} ({condition})\n"
                     f"Current price: ${price_data['price_usd']:,.2f}"
                 ),
                 "alert_id": alert_id

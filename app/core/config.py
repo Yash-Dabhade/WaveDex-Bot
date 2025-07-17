@@ -16,16 +16,14 @@ class Settings(BaseSettings):
     # Database
     DATABASE_URL: str
 
-    # Redis
-    REDIS_URL: str
-
     # Telegram
     TELEGRAM_BOT_TOKEN: str
 
     # API Keys
-    COINGECKO_API_KEY: Optional[str] = None
+    COINGECKO_API_KEY: str = ""
     CRYPTOPANIC_API_KEY: str
     NEWS_API_KEY: Optional[str] = None
+    COINMARKETCAP_API_KEY: str = None
 
     class Config:
         env_file = ".env"

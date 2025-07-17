@@ -1,6 +1,9 @@
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 import aiohttp
 from loguru import logger
+from datetime import datetime, timedelta
+
+from app.core.config import settings
 
 class PriceService:
     def __init__(self):
@@ -17,6 +20,85 @@ class PriceService:
         if self.session:
             await self.session.close()
             self.session = None
+
+    async def get_supported_coins(self) -> Dict[str, Any]:
+        """Get list of supported cryptocurrencies"""
+        try:
+            if not self.session:
+                await self.initialize()
+
+            url = f"{self.base_url}/coins/list"
+            async with self.session.get(url) as response:
+                if response.status == 429:
+                    return {"error": "Rate limit exceeded. Please try again later."}
+                elif response.status != 200:
+                    return {"error": "Failed to fetch supported coins"}
+
+                data = await response.json()
+                
+                # Sort by symbol
+                coins = sorted(data, key=lambda x: x['symbol'])
+                return {
+                    "coins": coins
+                }
+
+        except Exception as e:
+            logger.error(f"Error fetching supported coins: {e}")
+            return {"error": "Failed to fetch supported coins"}
+
+    async def get_price_history(self, symbol: str, days: int = 7) -> Dict[str, Any]:
+        """Get historical price data for a cryptocurrency"""
+        try:
+            if not self.session:
+                await self.initialize()
+
+            # Get coin ID first
+            coin_id = await self._get_coin_id(symbol.lower())
+            if not coin_id:
+                return {"error": f"Cryptocurrency {symbol} not found"}
+
+            # Fetch historical data
+            url = f"{self.base_url}/coins/{coin_id}/market_chart"
+            params = {
+                "vs_currency": "usd",
+                "days": str(days),
+                "interval": "daily"
+            }
+
+            async with self.session.get(url, params=params) as response:
+                if response.status == 429:
+                    return {"error": "Rate limit exceeded. Please try again later."}
+                elif response.status != 200:
+                    return {"error": "Failed to fetch price history"}
+
+                data = await response.json()
+
+                # Process historical data
+                history = []
+                for i in range(min(len(data['prices']), days)):
+                    timestamp = int(data['prices'][i][0] / 1000)
+                    price = data['prices'][i][1]
+                    volume = data['total_volumes'][i][1] if i < len(data['total_volumes']) else 0
+                    
+                    # Calculate 24h change
+                    prev_price = data['prices'][i-1][1] if i > 0 else price
+                    change_24h = ((price - prev_price) / prev_price) * 100
+
+                    history.append({
+                        "timestamp": timestamp,
+                        "price": price,
+                        "volume": volume,
+                        "change_24h": change_24h
+                    })
+
+                return {
+                    "symbol": symbol.upper(),
+                    "history": history
+                }
+
+        except Exception as e:
+            logger.error(f"Error fetching price history for {symbol}: {e}")
+            return {"error": "Failed to fetch price history"}
 
     async def get_price(self, symbol: str) -> Dict[str, Any]:
         """Get current price and 24h stats for a cryptocurrency"""

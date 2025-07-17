@@ -4,7 +4,7 @@ from datetime import datetime
 
 from app.services.prisma_service import prisma_service
 from app.services.news_service import news_service
-from app.core.telegram import bot_instance
+from app.services.notification_service import notification_service
 from app.models.schemas import Subscription, NewsItem, SubscriptionTier
 
 class SubscriptionService:
@@ -112,21 +112,16 @@ class SubscriptionService:
         subscriptions: List[Dict]
     ):
         """Send news updates to subscribers"""
-        if not bot_instance.bot:
-            logger.error("Telegram bot not initialized")
-            return
-
+        # Notification service will log if bot is not initialized
         for sub in subscriptions:
             try:
                 # Format message
                 message = self._format_news_message(symbol, news_items)
 
                 # Send message
-                await bot_instance.bot.send_message(
+                await notification_service.send_message(
                     chat_id=sub.user.telegramId,
-                    text=message,
-                    parse_mode="HTML",
-                    disable_web_page_preview=True
+                    text=message
                 )
 
             except Exception as e:

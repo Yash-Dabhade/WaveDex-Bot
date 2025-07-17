@@ -15,7 +15,6 @@ A FastAPI-based Telegram bot that delivers personalized crypto news, price alert
 - FastAPI
 - Prisma ORM
 - PostgreSQL
-- Redis
 - Telegram Bot API
 - Python 3.9+
 
@@ -23,7 +22,6 @@ A FastAPI-based Telegram bot that delivers personalized crypto news, price alert
 
 - Python 3.9+
 - PostgreSQL
-- Redis
 - Telegram Bot Token
 
 ## Setup

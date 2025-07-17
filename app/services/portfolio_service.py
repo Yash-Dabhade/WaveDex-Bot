@@ -1,9 +1,11 @@
 from typing import List, Dict, Optional
 from loguru import logger
 from decimal import Decimal
+from datetime import datetime
 
 from app.services.prisma_service import prisma_service
 from app.services.coingecko_service import coingecko_service
+from app.services.coinmarketcap_service import coinmarketcap_service
 from app.models.schemas import Portfolio, MarketData
 
 class PortfolioService:
@@ -69,15 +71,47 @@ class PortfolioService:
     ) -> Portfolio:
         """Add or update portfolio position"""
         try:
-            # Validate symbol exists
+            symbol = symbol.upper()
+            
+            # Try CoinGecko first
             market_data = await coingecko_service.get_price(symbol)
+            
+            # If CoinGecko fails, try getting data from CoinMarketCap
+            if not market_data:
+                try:
+                    # Get current listings from cache if available
+                    cache_key = "cmc_listings"
+                    cached_listings = await coinmarketcap_service.cache.get_key(cache_key)
+                    
+                    if not cached_listings:
+                        # Fetch fresh listings
+                        listings = await coinmarketcap_service.get_trending_coins(limit=5000)
+                        await coinmarketcap_service.cache.set_key(cache_key, listings, expiry=600)
+                        cached_listings = listings
+                    
+                    # Find the coin in listings
+                    coin = next((c for c in cached_listings if c["symbol"] == symbol), None)
+                    if coin:
+                        market_data = MarketData(
+                            symbol=symbol,
+                            price=coin["price"],
+                            price_change_24h=coin["percent_change_24h"],
+                            market_cap=coin["market_cap"],
+                            volume_24h=coin["volume_24h"],
+                            high_24h=coin["price"] * (1 + coin["percent_change_24h"]/100),
+                            low_24h=coin["price"] * (1 - coin["percent_change_24h"]/100),
+                            last_updated=datetime.fromtimestamp(coin["last_updated"])
+                        )
+                except Exception as e:
+                    logger.error(f"Error fetching CMC data for {symbol}: {e}")
+            
             if not market_data:
                 raise ValueError(f"Invalid symbol: {symbol}")
 
             # Get existing position
             portfolio = await prisma_service.get_user_portfolio(user_id)
             existing = next(
-                (p for p in portfolio if p["symbol"] == symbol.upper()),
+                (p for p in portfolio if p["symbol"] == symbol),
                 None
             )
 
@@ -196,6 +230,52 @@ class PortfolioService:
 
         except Exception as e:
             logger.error(f"Error getting portfolio summary: {e}")
+            raise
+
+    async def get_watchlist_performance(self, user_id: str) -> List[Dict]:
+        """Get performance data for watchlisted coins"""
+        try:
+            # Get portfolio entries
+            portfolio_entries = await prisma_service.get_user_portfolio(user_id)
+            
+            # Get current market data for all symbols
+            result = []
+            for entry in portfolio_entries:
+                market_data = await coingecko_service.get_price(entry["symbol"])
+                if not market_data:
+                    continue
+
+                result.append({
+                    "symbol": entry["symbol"],
+                    "price": market_data.price,
+                    "price_change_24h": market_data.price_change_24h,
+                    "volume_24h": market_data.volume_24h,
+                    "market_cap": market_data.market_cap,
+                    "high_24h": market_data.high_24h,
+                    "low_24h": market_data.low_24h
+                })
+
+            # Sort by 24h price change
+            result.sort(key=lambda x: abs(x["price_change_24h"]), reverse=True)
+            return result
+
+        except Exception as e:
+            logger.error(f"Error getting watchlist performance: {e}")
+            raise
+
+    async def get_trending_coins(self, limit: int = 10) -> List[Dict]:
+        """Get top trending coins by price change"""
+        try:
+            # Get trending coins from CoinMarketCap
+            trending = await coinmarketcap_service.get_trending_coins(limit=limit)
+            
+            # Sort by absolute percent change to show both top gainers and losers
+            trending.sort(key=lambda x: abs(x["percent_change_24h"]), reverse=True)
+            
+            return trending[:limit]
+
+        except Exception as e:
+            logger.error(f"Error getting trending coins: {e}")
             raise
 
 # Create singleton instance
