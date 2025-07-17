@@ -240,11 +240,9 @@ class TelegramBot:
             keyboard = [
                 [
                     InlineKeyboardButton("📈 View History", callback_data=f"history_{symbol}_7"),
-                    InlineKeyboardButton("🔄 Refresh", callback_data=f"price_{symbol}")
                 ],
                 [
                     InlineKeyboardButton("🔔 Set Price Alert", callback_data=f"alert_{symbol}"),
-                    InlineKeyboardButton("📰 Latest News", callback_data=f"news_{symbol}")
                 ],
                 [
                     InlineKeyboardButton("❌ Close", callback_data="close")
@@ -422,74 +420,233 @@ class TelegramBot:
         query = update.callback_query
         await query.answer()
         
-        if query.data.startswith('coins_'):
-            # Handle coins pagination
-            try:
-                page = int(query.data.split('_')[1])
-                # Call the coins command with the new page
-                await self._coins_command(update, context, page=page, is_callback=True)
-            except (ValueError, IndexError) as e:
-                logger.error(f"Invalid page number in callback: {query.data}")
-                await query.answer("❌ Invalid page number")
-            except Exception as e:
-                logger.error(f"Error in coins pagination: {e}")
-                await query.answer("❌ Failed to load page")
-        elif query.data == 'close':
-            # Handle close button
-            try:
-                await query.message.delete()
-            except Exception as e:
-                logger.error(f"Error deleting message: {e}")
-                await query.answer("❌ Failed to close message")
-
-    async def _price_history_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /history command"""
         try:
-            if not context.args:
-                await update.message.reply_text(
-                    "Please provide a cryptocurrency symbol and optional number of days.\n"
-                    "Example: /history btc 7"
-                )
-                return
-
-            loading_msg = await self._send_loading_message(update)
-
-            symbol = context.args[0].lower()
-            days = int(context.args[1]) if len(context.args) > 1 else 7
+            if query.data.startswith('coins_'):
+                # Handle coins pagination
+                try:
+                    page = int(query.data.split('_')[1])
+                    await self._coins_command(update, context, page=page, is_callback=True)
+                except (ValueError, IndexError) as e:
+                    logger.error(f"Invalid page number in callback: {query.data}")
+                    await query.answer("❌ Invalid page number")
+                except Exception as e:
+                    logger.error(f"Error in coins pagination: {e}")
+                    await query.answer("❌ Failed to load page")
             
-            # Limit days to reasonable range
-            days = min(max(days, 1), 30)
-
-            history = await price_service.get_price_history(symbol, days)
+            elif query.data.startswith('history_'):
+                # Handle history time period selection
+                try:
+                    parts = query.data.split('_')
+                    symbol = parts[1]
+                    days = int(parts[2]) if len(parts) > 2 else 7
+                    await self._price_history_command(update, context, symbol, days, is_callback=True)
+                except (ValueError, IndexError) as e:
+                    logger.error(f"Invalid history parameters in callback: {query.data}")
+                    await query.answer("❌ Invalid parameters")
+                except Exception as e:
+                    logger.error(f"Error in history callback: {e}")
+                    await query.answer("❌ Failed to load history")
             
-            await self._delete_message_safe(loading_msg)
-
-            if "error" in history:
-                await update.message.reply_text(f"❌ {history['error']}")
-                return
-
-            # Format price history message
-            message = f"📊 {history['symbol']} Price History ({days} days):\n\n"
+            elif query.data.startswith('price_'):
+                # Handle price refresh from button
+                try:
+                    symbol = query.data.split('_')[1]
+                    await self._price_command(update, context, symbol=symbol, is_callback=True)
+                except (ValueError, IndexError) as e:
+                    logger.error(f"Invalid price parameters in callback: {query.data}")
+                    await query.answer("❌ Invalid parameters")
+                except Exception as e:
+                    logger.error(f"Error in price callback: {e}")
+                    await query.answer("❌ Failed to load price")
             
-            for entry in history['history']:
-                date = datetime.fromtimestamp(entry['timestamp']).strftime('%Y-%m-%d')
-                message += (
-                    f"📅 {date}\n"
-                    f"Price: ${entry['price']:,.2f}\n"
-                    f"Change: {entry['change_24h']:+.2f}%\n"
-                    f"Volume: ${entry['volume']:,.0f}\n"
-                    f"---------------\n"
-                )
-
-            await update.message.reply_text(message)
-
-        except ValueError:
-            await self._delete_message_safe(loading_msg)
-            await update.message.reply_text("❌ Invalid number of days. Please provide a number between 1 and 30.")
+            elif query.data == 'close':
+                # Handle close button
+                try:
+                    await query.message.delete()
+                except Exception as e:
+                    logger.error(f"Error deleting message: {e}")
+                    await query.answer("❌ Failed to close message")
+            
+            else:
+                await query.answer("⚠️ This button doesn't do anything yet!")
+        
         except Exception as e:
-            logger.error(f"Error in history command: {e}")
+            logger.error(f"Error in button callback: {e}", exc_info=True)
+            try:
+                await query.answer("❌ An error occurred. Please try again.")
+            except:
+                pass
+
+    async def _price_history_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE, symbol: str = None, days: int = 7, is_callback: bool = False):
+        """Handle /history command with improved formatting and navigation"""
+        try:
+            # Get message object based on whether this is a callback or command
+            message = update.callback_query.message if is_callback else update.message
+            
+            # Get symbol and days from command args if not provided
+            if not symbol or not is_callback:
+                if not context.args:
+                    await message.reply_text(
+                        "📈 <b>Price History</b>\n\n"
+                        "Please provide a cryptocurrency symbol.\n"
+                        "Example: <code>/history btc 7</code>\n"
+                        "(7 days is default if no number is provided)",
+                        parse_mode='HTML'
+                    )
+                    return
+                
+                symbol = context.args[0].lower()
+                if len(context.args) > 1:
+                    try:
+                        days = int(context.args[1])
+                        if not 1 <= days <= 30:
+                            raise ValueError("Days must be between 1 and 30")
+                    except ValueError:
+                        await message.reply_text(
+                            "❌ <b>Invalid number of days</b>\n\n"
+                            "Please provide a number between 1 and 30.\n"
+                            "Example: <code>/history btc 7</code>",
+                            parse_mode='HTML'
+                        )
+                        return
+
+            # Show loading message
+            loading_msg = None
+            if not is_callback:
+                loading_msg = await self._send_loading_message(update)
+
+            # Get historical data
+            history_data = await price_service.get_price_history(symbol, days)
             await self._delete_message_safe(loading_msg)
-            await update.message.reply_text("❌ Failed to fetch price history. Please try again later.")
+
+            if not history_data or 'error' in history_data:
+                error_msg = (
+                    f"❌ <b>History Not Available</b>\n\n"
+                    f"Could not fetch history for <code>{symbol.upper()}</code>.\n"
+                    f"Error: {history_data.get('error', 'Unknown error') if history_data else 'No data'}"
+                )
+                
+                if is_callback:
+                    await update.callback_query.edit_message_text(
+                        text=error_msg,
+                        parse_mode='HTML',
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("🔄 Try Again", callback_data=f"history_{symbol}_{days}")],
+                            [InlineKeyboardButton("🔙 Back", callback_data=f"price_{symbol}")]
+                        ])
+                    )
+                else:
+                    await message.reply_text(
+                        error_msg,
+                        parse_mode='HTML',
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("🔄 Try Again", callback_data=f"history_{symbol}_{days}")],
+                            [InlineKeyboardButton("🔙 Back", callback_data=f"price_{symbol}")]
+                        ])
+                    )
+                return
+
+            # Format the history data
+            symbol = history_data.get('symbol', symbol.upper())
+            history = history_data.get('history', [])
+
+            if not history:
+                no_data_msg = f"❌ No historical data available for {symbol}"
+                if is_callback:
+                    await update.callback_query.edit_message_text(
+                        text=no_data_msg,
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("🔙 Back", callback_data=f"price_{symbol}")]
+                        ])
+                    )
+                else:
+                    await message.reply_text(no_data_msg)
+                return
+
+            # Calculate price change for the period
+            first_price = history[0].get('price', 0) if history else 0
+            last_price = history[-1].get('price', 0) if history else 0
+            price_change = ((last_price - first_price) / first_price * 100) if first_price else 0
+            change_emoji = '🟢' if price_change >= 0 else '🔴'
+
+            # Format the message
+            message_text = (
+                f"📈 <b>{symbol} Price History</b>\n"
+                f"<code>────────────────────</code>\n"
+                f"📅 <b>Period:</b> {days} day{'s' if days > 1 else ''}\n"
+                f"💰 <b>Current Price:</b> ${last_price:,.2f}\n"
+                f"{change_emoji} <b>Period Change:</b> {change_emoji} {abs(price_change):.2f}%\n"
+                f"📊 <b>Data Points:</b> {len(history)}\n"
+                f"<code>────────────────────</code>\n"
+                f"📅 <b>Latest Data Points:</b>\n"
+            )
+
+            # Add last 5 data points (or all if less than 5)
+            for i, point in enumerate(history[-5:], 1):
+                timestamp = point.get('timestamp', 0) / 1000  # Convert from ms to seconds if needed
+                date = datetime.fromtimestamp(timestamp).strftime('%b %d, %H:%M')
+                price = point.get('price', 0)
+                message_text += f"• {date}: <b>${price:,.2f}</b>\n"
+
+            # Create inline keyboard with time period options
+            keyboard = [
+                [
+                    InlineKeyboardButton("24h", callback_data=f"history_{symbol}_1"),
+                    InlineKeyboardButton("7d", callback_data=f"history_{symbol}_7"),
+                    InlineKeyboardButton("30d", callback_data=f"history_{symbol}_30")
+                ],
+                [
+                    InlineKeyboardButton("🔙 Back to Price", callback_data=f"price_{symbol}"),
+                    InlineKeyboardButton("❌ Close", callback_data="close")
+                ]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            if is_callback:
+                await update.callback_query.edit_message_text(
+                    text=message_text,
+                    parse_mode='HTML',
+                    reply_markup=reply_markup
+                )
+                await update.callback_query.answer()
+            else:
+                await message.reply_text(
+                    message_text,
+                    parse_mode='HTML',
+                    reply_markup=reply_markup,
+                    disable_web_page_preview=True
+                )
+
+        except ValueError as ve:
+            error_msg = (
+                "❌ <b>Invalid Input</b>\n\n"
+                f"{str(ve)}\n\n"
+                "Please provide a valid number between 1 and 30 for days.\n"
+                "Example: <code>/history btc 7</code>"
+            )
+            if is_callback:
+                await update.callback_query.answer(str(ve))
+            else:
+                await message.reply_text(error_msg, parse_mode='HTML')
+                
+        except Exception as e:
+            logger.error(f"Error in history command: {e}", exc_info=True)
+            error_msg = "❌ Failed to fetch price history. Please try again later."
+            
+            if is_callback:
+                try:
+                    await update.callback_query.edit_message_text(
+                        text=error_msg,
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("🔄 Try Again", callback_data=f"history_{symbol}_{days}")],
+                            [InlineKeyboardButton("❌ Close", callback_data="close")]
+                        ])
+                    )
+                except Exception as edit_error:
+                    logger.error(f"Error editing message: {edit_error}")
+                    await update.callback_query.answer("❌ Error: Could not update message")
+            else:
+                await message.reply_text(error_msg)
 
     async def _news_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /news command - Show detailed news with images and descriptions"""
