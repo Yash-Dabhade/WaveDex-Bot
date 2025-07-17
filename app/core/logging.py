@@ -1,6 +1,6 @@
 import sys
 from loguru import logger
-from app.core.config import settings
+from env import env
 
 def setup_logging():
     # Remove default handler
@@ -10,7 +10,7 @@ def setup_logging():
     logger.add(
         sys.stderr,
         format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}",
-        level=settings.LOG_LEVEL,
+        level=env.LOG_LEVEL,
         backtrace=True,
         diagnose=True,
     )
@@ -30,9 +30,9 @@ def setup_logging():
     logger.add(
         "logs/app.log",
         format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}",
-        level=settings.LOG_LEVEL,
+        level=env.LOG_LEVEL,
         rotation="1 day",
         retention="7 days",
     )
 
-    logger.info(f"Logging setup complete. Level: {settings.LOG_LEVEL}") 
+    logger.info(f"Logging setup complete. Level: {env.LOG_LEVEL}") 

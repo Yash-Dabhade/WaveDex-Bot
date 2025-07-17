@@ -4,7 +4,7 @@ from loguru import logger
 from datetime import datetime
 import asyncio
 
-from app.core.config import settings
+from env import env
 from app.models.schemas import MarketData
 from app.services.cache_service import CacheService
 
@@ -21,7 +21,7 @@ class CoinGeckoService:
 
     def __init__(self):
         if not self._initialized:
-            self.api_key = settings.COINGECKO_API_KEY
+            self.api_key = env.COINGECKO_API_KEY
             self.client = httpx.AsyncClient(
                 base_url=self.BASE_URL,
                 timeout=30.0,

@@ -1,19 +1,20 @@
-from telegram import Bot, Update, Message
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Bot, Update, Message, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
 from telegram.constants import ParseMode
 from loguru import logger
 from typing import Optional, Tuple
 import asyncio
 from datetime import datetime, timedelta
 
-from app.core.config import settings
+from env import env
 from app.services.cache_service import CacheService
 from app.services.price_service import price_service
 from app.services.news_service import news_service
 from app.services.alert_service import alert_service
 from app.services.notification_service import notification_service
 from app.services.portfolio_service import portfolio_service
-from app.services.prisma_service import prisma_service
+from app.core.db import db
+from app.services.coin_service import coin_service
 
 class TelegramBot:
     _instance: Optional['TelegramBot'] = None
@@ -26,7 +27,7 @@ class TelegramBot:
 
     def __init__(self):
         if not self._initialized:
-            self.token = settings.TELEGRAM_BOT_TOKEN
+            self.token = env.TELEGRAM_BOT_TOKEN
             self.application: Optional[Application] = None
             self.bot: Optional[Bot] = None
             self.cache = CacheService()
@@ -40,7 +41,7 @@ class TelegramBot:
             # Initialize services
             await price_service.initialize()
             await news_service.initialize()
-            await prisma_service.initialize()  # Initialize Prisma service
+            await db.connect()  # Initialize database connection
             
             # Initialize bot and application
             self.bot = Bot(token=self.token)
@@ -101,25 +102,30 @@ class TelegramBot:
         if not self.application:
             raise RuntimeError("Application not initialized")
 
+        # Define command handlers with descriptions
         commands = [
             ("start", "Start the bot", self._start_command),
             ("help", "Show available commands", self._help_command),
             ("price", "Get current price for a coin", self._price_command),
             ("coins", "List supported coins", self._coins_command),
             ("history", "View price history", self._price_history_command),
-            ("alert", "Set price alert", self._set_alert_command),
+            ("trending", "Show trending coins", self._trending_command),
+            ("headlines", "Get top 5 crypto headlines", self._headlines_command),
+            ("news", "Get latest crypto news with images and descriptions", self._news_command),
+            ("setalert", "Set price alert", self._set_alert_command),
             ("alerts", "View your active alerts", self._list_alerts_command),
             ("delalert", "Delete an alert", self._delete_alert_command),
-            ("news", "Get latest crypto news", self._news_command),
             ("portfolio", "View your portfolio", self._portfolio_command),
-            ("trending", "Show trending coins", self._trending_command),
             ("add", "Add position to portfolio", self._add_position_command),
             ("remove", "Remove position from portfolio", self._remove_position_command),
         ]
 
-        # Register handlers
-        for command, description, handler in commands:
+        # Register command handlers
+        for command, _, handler in commands:
             self.application.add_handler(CommandHandler(command, handler))
+        
+        # Register callback query handler
+        self.application.add_handler(CallbackQueryHandler(self._button_callback))
 
         # Set commands in Telegram
         await self.bot.set_my_commands([
@@ -156,91 +162,285 @@ class TelegramBot:
             "/alerts - View your alerts\n"
             "/delalert [id] - Delete alert\n\n"
             "📰 News\n"
-            "/news [symbol] - Latest crypto news"
+            "/news - Latest crypto news with images and descriptions\n"
+            "/headlines - Top 5 crypto headlines"
         )
         await update.message.reply_text(help_message)
 
-    async def _price_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /price command"""
+    async def _price_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE, symbol: str = None, is_callback: bool = False):
+        """Handle /price command with improved formatting"""
         try:
-            if not context.args:
-                await update.message.reply_text(
-                    "Please provide a cryptocurrency symbol.\n"
-                    "Example: /price btc\n"
-                    "Use /coins to see supported cryptocurrencies"
-                )
-                return
+            # Get symbol from callback or command args
+            if not symbol:
+                if not context.args:
+                    await update.message.reply_text(
+                        "💱 <b>Price Check</b>\n\n"
+                        "Please provide a cryptocurrency symbol.\n"
+                        "Example: <code>/price btc</code>\n"
+                        "Use /coins to see supported cryptocurrencies",
+                        parse_mode='HTML'
+                    )
+                    return
+                symbol = context.args[0].lower()
 
             # Show loading message
-            loading_msg = await self._send_loading_message(update)
+            message = update.callback_query.message if is_callback else update.message
+            loading_msg = None
+            if not is_callback:
+                loading_msg = await self._send_loading_message(update)
 
-            symbol = context.args[0].lower()
+            # Get price data
             price_data = await price_service.get_price(symbol)
-
-            # Delete loading message
             await self._delete_message_safe(loading_msg)
 
-            if "error" in price_data:
-                await update.message.reply_text(f"❌ {price_data['error']}")
+            if not price_data or 'error' in price_data:
+                error_msg = (
+                    f"❌ <b>Symbol Not Found</b>\n\n"
+                    f"Could not find data for <code>{symbol.upper()}</code>.\n"
+                    f"Error: {price_data.get('error', 'Unknown error')}\n\n"
+                    "Please check the symbol and try again.\n"
+                    "Use /coins to see supported cryptocurrencies"
+                )
+                if is_callback:
+                    await update.callback_query.edit_message_text(
+                        text=error_msg,
+                        parse_mode='HTML',
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("🔄 Try Again", callback_data=f"price_{symbol}")],
+                            [InlineKeyboardButton("❌ Close", callback_data="close")]
+                        ])
+                    )
+                else:
+                    await update.message.reply_text(
+                        error_msg,
+                        parse_mode='HTML',
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("🔄 Try Again", callback_data=f"price_{symbol}")],
+                            [InlineKeyboardButton("❌ Close", callback_data="close")]
+                        ])
+                    )
                 return
 
-            # Format the price message with more details
-            message = (
-                f"💰 {price_data['symbol']} Price Analysis:\n\n"
-                f"Current Price: ${price_data['price_usd']:,.2f}\n"
-                f"24h Change: {price_data['change_24h']:+.2f}%\n"
-                f"24h Volume: ${price_data['volume_24h']:,.0f}\n"
-                f"Market Cap: ${price_data['market_cap']:,.0f}\n\n"
-                f"Quick Actions:\n"
-                f"📈 Price History: /history {symbol}\n"
-                f"🔔 Set Alert: /alert {symbol} [price] [above/below]\n"
-                f"📰 Latest News: /news {symbol}"
+            # Format the message with the available data
+            change_24h = price_data.get('change_24h', 0)
+            change_emoji = '🟢' if change_24h >= 0 else '🔴'
+            
+            message_text = (
+                f"📊 <b>{(symbol or '').upper()} Price</b>\n"
+                f"<code>────────────────────</code>\n"
+                f"💰 <b>Price:</b> ${price_data.get('price_usd', 0):,.2f}\n"
+                f"{change_emoji} <b>24h Change:</b> {change_emoji} {abs(change_24h):.2f}%\n"
+                f"📊 <b>24h Volume:</b> ${price_data.get('volume_24h', 0):,.0f}\n"
+                f"💎 <b>Market Cap:</b> ${price_data.get('market_cap', 0):,.0f}\n"
+                f"<code>────────────────────</code>\n"
+                f"🔍 <b>Quick Actions</b> (click buttons below)"
             )
 
-            await update.message.reply_text(message)
+            # Create inline keyboard with actions
+            keyboard = [
+                [
+                    InlineKeyboardButton("📈 View History", callback_data=f"history_{symbol}_7"),
+                    InlineKeyboardButton("🔄 Refresh", callback_data=f"price_{symbol}")
+                ],
+                [
+                    InlineKeyboardButton("🔔 Set Price Alert", callback_data=f"alert_{symbol}"),
+                    InlineKeyboardButton("📰 Latest News", callback_data=f"news_{symbol}")
+                ],
+                [
+                    InlineKeyboardButton("❌ Close", callback_data="close")
+                ]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            if is_callback:
+                await update.callback_query.edit_message_text(
+                    text=message_text,
+                    parse_mode='HTML',
+                    reply_markup=reply_markup,
+                    disable_web_page_preview=True
+                )
+                await update.callback_query.answer()
+            else:
+                await update.message.reply_text(
+                    message_text,
+                    parse_mode='HTML',
+                    reply_markup=reply_markup,
+                    disable_web_page_preview=True
+                )
 
         except Exception as e:
-            logger.error(f"Error in price command: {e}")
-            await self._delete_message_safe(loading_msg)
-            await update.message.reply_text("❌ Failed to fetch price data. Please try again later.")
+            logger.error(f"Error in price command: {e}", exc_info=True)
+            if 'loading_msg' in locals() and loading_msg:
+                try:
+                    await self._delete_message_safe(loading_msg)
+                except Exception as del_error:
+                    logger.error(f"Error deleting loading message: {del_error}")
+            
+            error_msg = (
+                "❌ <b>Error fetching price data</b>\n\n"
+                "We encountered an issue while fetching the price data.\n"
+                "Please try again in a moment."
+            )
+            
+            if is_callback:
+                try:
+                    await update.callback_query.edit_message_text(
+                        text=error_msg,
+                        parse_mode='HTML',
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("🔄 Try Again", callback_data=f"price_{symbol}")],
+                            [InlineKeyboardButton("❌ Close", callback_data="close")]
+                        ])
+                    )
+                except Exception as edit_error:
+                    logger.error(f"Error editing message: {edit_error}")
+                    try:
+                        await update.callback_query.answer("❌ Error: Could not update message")
+                    except:
+                        pass
+            else:
+                try:
+                    await update.message.reply_text(
+                        error_msg,
+                        parse_mode='HTML',
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("🔄 Try Again", callback_data=f"price_{symbol}")],
+                            [InlineKeyboardButton("❌ Close", callback_data="close")]
+                        ])
+                    )
+                except Exception as send_error:
+                    logger.error(f"Error sending error message: {send_error}")
 
-    async def _coins_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /coins command"""
+    async def _coins_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 1, is_callback: bool = False):
+        """Handle /coins command with improved pagination"""
         try:
-            loading_msg = await self._send_loading_message(update)
+            # Get the message object based on whether this is a callback or command
+            message = update.callback_query.message if is_callback else update.message
             
-            coins = await price_service.get_supported_coins()
+            # Get page number from command args if not provided
+            if not is_callback and context.args:
+                try:
+                    page = max(1, int(context.args[0]))
+                except (ValueError, IndexError):
+                    pass
             
-            await self._delete_message_safe(loading_msg)
-
-            if "error" in coins:
-                await update.message.reply_text(f"❌ {coins['error']}")
+            per_page = 10  # Reduced number of coins per page for better readability
+            
+            # Show loading message
+            loading_msg = None
+            if not is_callback:  # Only show loading for initial command, not for callbacks
+                loading_msg = await self._send_loading_message(update)
+            
+            # Get coins from service
+            coins = await coin_service.get_coins(page=page, per_page=per_page)
+            
+            # Delete loading message if it exists
+            if loading_msg:
+                await self._delete_message_safe(loading_msg)
+            
+            if not coins:
+                if is_callback:
+                    await update.callback_query.answer("No more coins to show!")
+                    return
+                await update.message.reply_text("❌ No coins found. Please try again later.")
                 return
-
-            # Split coins into multiple messages if needed
-            message = "🪙 Supported Cryptocurrencies:\n\n"
-            chunks = []
-            current_chunk = []
-
-            for coin in coins['coins']:
-                line = f"• {coin['symbol'].upper()}: {coin['name']}\n"
-                if len(message) + len("".join(current_chunk)) + len(line) > 4000:
-                    chunks.append("".join(current_chunk))
-                    current_chunk = []
-                current_chunk.append(line)
-
-            if current_chunk:
-                chunks.append("".join(current_chunk))
-
-            # Send messages
-            await update.message.reply_text(message)
-            for chunk in chunks:
-                await update.message.reply_text(chunk)
+            
+            # Format message with better spacing and emojis
+            message_text = [
+                "<b>💰 Top Cryptocurrencies</b>\n",
+                f"<i>Showing {len(coins)} coins • Page {page}</i>\n\n"
+            ]
+            
+            for i, coin in enumerate(coins, 1):
+                change_24h = coin.get('price_change_percentage_24h', 0)
+                change_emoji = '🟢' if change_24h >= 0 else '🔴'
+                
+                message_text.append(
+                    f"<b>{i + (page-1)*per_page}. {coin['name']} ({coin['symbol'].upper()})</b>\n"
+                    f"   💵 Price: ${coin['current_price']:,.2f}\n"
+                    f"   {change_emoji} 24h: {change_emoji} {abs(change_24h):.2f}%\n"
+                    f"   📊 Market Cap: ${coin['market_cap']/1_000_000_000:,.2f}B\n"
+                    f"   ──────────────────────────\n"
+                )
+            
+            # Create inline keyboard with a single "Show More" button
+            keyboard = []
+            
+            # Add Show More button if there are more coins to show
+            if len(coins) == per_page:  # Only show if there might be more
+                keyboard.append([
+                    InlineKeyboardButton("🔄 Refresh", callback_data=f"coins_{page}"),
+                    InlineKeyboardButton("Show More ➡️", callback_data=f"coins_{page+1}")
+                ])
+            else:
+                keyboard.append([
+                    InlineKeyboardButton("🔄 Refresh", callback_data=f"coins_{page}")
+                ])
+            
+            reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+            
+            # Join message parts
+            message_text = "\n".join(message_text)
+            
+            # If it's a callback (pagination), edit the existing message
+            if is_callback:
+                try:
+                    await update.callback_query.edit_message_text(
+                        text=message_text,
+                        parse_mode='HTML',
+                        reply_markup=reply_markup
+                    )
+                    await update.callback_query.answer()
+                except Exception as e:
+                    logger.error(f"Error updating coins message: {e}")
+                    await update.callback_query.answer("Failed to update. Please try again.")
+            else:
+                # Send new message for initial command
+                await update.message.reply_text(
+                    message_text,
+                    parse_mode='HTML',
+                    reply_markup=reply_markup,
+                    disable_web_page_preview=True
+                )
 
         except Exception as e:
             logger.error(f"Error in coins command: {e}")
-            await self._delete_message_safe(loading_msg)
-            await update.message.reply_text("❌ Failed to fetch supported coins. Please try again later.")
+            if 'loading_msg' in locals() and loading_msg:
+                await self._delete_message_safe(loading_msg)
+            
+            error_msg = "❌ Failed to fetch coins. Please try again later."
+            if is_callback:
+                try:
+                    await update.callback_query.answer(error_msg)
+                except:
+                    pass
+            else:
+                await update.message.reply_text(error_msg)
+
+    async def _button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle button callbacks"""
+        query = update.callback_query
+        await query.answer()
+        
+        if query.data.startswith('coins_'):
+            # Handle coins pagination
+            try:
+                page = int(query.data.split('_')[1])
+                # Call the coins command with the new page
+                await self._coins_command(update, context, page=page, is_callback=True)
+            except (ValueError, IndexError) as e:
+                logger.error(f"Invalid page number in callback: {query.data}")
+                await query.answer("❌ Invalid page number")
+            except Exception as e:
+                logger.error(f"Error in coins pagination: {e}")
+                await query.answer("❌ Failed to load page")
+        elif query.data == 'close':
+            # Handle close button
+            try:
+                await query.message.delete()
+            except Exception as e:
+                logger.error(f"Error deleting message: {e}")
+                await query.answer("❌ Failed to close message")
 
     async def _price_history_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /history command"""
@@ -292,40 +492,86 @@ class TelegramBot:
             await update.message.reply_text("❌ Failed to fetch price history. Please try again later.")
 
     async def _news_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /news command"""
+        """Handle /news command - Show detailed news with images and descriptions"""
         try:
-            # Get symbol if provided
-            symbol = context.args[0].lower() if context.args else None
+            # Send typing action
+            await update.message.chat.send_action(action='typing')
             
-            # Fetch news (limit to 3 items to avoid message length issues)
-            news_data = await news_service.get_news(symbol, limit=3)
+            # Get news items
+            news_items = await news_service.get_news(limit=3)
             
-            if "error" in news_data:
-                await update.message.reply_text(f"❌ {news_data['error']}")
+            if not news_items:
+                await update.message.reply_text("❌ No news available at the moment. Please try again later.")
                 return
 
-            # Send header message
-            header = f"📰 Latest News for {news_data['symbol']}:"
-            await update.message.reply_text(header)
-            
-            # Send each news item as a separate message
-            for item in news_data['news']:
-                # Escape special characters in title
-                title = item['title'].replace('[', '\\[').replace('*', '\\*').replace('_', '\\_').replace('`', '\\`')
+            # Send each news item as a separate message with image and description
+            for item in news_items:
+                # Escape special characters in title and description
+                title = item.get('title', 'No title').replace('[', '\\[').replace('*', '\\*').replace('_', '\\_').replace('`', '\\`')
+                description = item.get('description', '').replace('[', '\\[').replace('*', '\\*').replace('_', '\\_').replace('`', '\\`')
                 
-                message = (
-                    f"🔸 {title}\n\n"
-                    f"📍 {item['source']} • {item['published']}\n"
-                    f"🔗 {item['url']}"
+                # Create caption with source and description
+                caption = (
+                    f"<b>{title}</b>\n\n"
+                    f"{description}\n\n"
+                    f"📰 Source: {item.get('source', 'Unknown')}\n"
+                    f"🔗 <a href='{item.get('url', '')}'>Read more</a>"
                 )
+                
+                # Send photo with caption if image is available, otherwise send text
+                if item.get('image'):
+                    try:
+                        await update.message.reply_photo(
+                            photo=item['image'],
+                            caption=caption,
+                            parse_mode='HTML',
+                            link_preview_options={"is_disabled": False}
+                        )
+                        continue
+                    except Exception as e:
+                        logger.warning(f"Failed to send photo: {e}")
+                        # Fall back to text if photo fails
+                
+                # If no image or image failed to send, send text only
                 await update.message.reply_text(
-                    message,
-                    disable_web_page_preview=True
+                    caption,
+                    parse_mode='HTML',
+                    link_preview_options={"is_disabled": False}
                 )
 
         except Exception as e:
             logger.error(f"Error in news command: {e}")
             await update.message.reply_text("❌ Failed to fetch news. Please try again later.")
+            
+    async def _headlines_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /headlines command - Show top 5 headlines"""
+        try:
+            # Send typing action
+            await update.message.chat.send_action(action='typing')
+            
+            # Get headlines
+            headlines = await news_service.get_headlines(limit=5)
+            
+            if not headlines:
+                await update.message.reply_text("❌ No headlines available at the moment. Please try again later.")
+                return
+            
+            # Format headlines message
+            message = ["<b>📰 Top Crypto Headlines:</b>\n"]
+            for i, item in enumerate(headlines, 1):
+                title = item.get('title', 'No title').replace('[', '\\[').replace('*', '\\*').replace('_', '\\_').replace('`', '\\`')
+                message.append(f"{i}. <a href='{item.get('url', '')}'>{title}</a> - {item.get('source', 'Unknown')}")
+            
+            # Send the message
+            await update.message.reply_text(
+                '\n\n'.join(message),
+                parse_mode='HTML',
+                link_preview_options={"is_disabled": True}
+            )
+            
+        except Exception as e:
+            logger.error(f"Error in headlines command: {e}")
+            await update.message.reply_text("❌ Failed to fetch headlines. Please try again later.")
 
     async def _set_alert_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /alert command"""
@@ -480,7 +726,8 @@ class TelegramBot:
                     "🔍 Find opportunities:\n"
                     "• /price [symbol] - Check current prices\n"
                     "• /trending - View trending coins\n"
-                    "• /news - Latest market news"
+                    "• /news - Latest market news with images\n"
+                    "• /headlines - Top 5 crypto headlines"
                 )
                 return
 
@@ -543,7 +790,8 @@ class TelegramBot:
                     "❌ No trending data available right now.\n\n"
                     "Try these instead:\n"
                     "📊 /price btc - Check Bitcoin price\n"
-                    "📰 /news - Get latest crypto news\n"
+                    "📰 /news - Latest crypto news with images\n"
+                    "📰 /headlines - Top 5 crypto headlines\n"
                     "💼 /portfolio - View your portfolio"
                 )
                 return
@@ -672,7 +920,7 @@ class TelegramBot:
                 f"Quick Actions:\n"
                 f"📊 /portfolio - View full portfolio\n"
                 f"🔔 /alert - Set price alert\n"
-                f"📰 /news {symbol} - Get latest news"
+                f"📰 /news - Get latest news with images"
             )
 
             await update.message.reply_text(message)
@@ -787,7 +1035,7 @@ class TelegramBot:
             # Cleanup services
             await price_service.close()
             await news_service.close()
-            await prisma_service.shutdown()  # Shutdown Prisma service
+            await db.disconnect()  # Close database connection
             await self.cache.close()
             
             logger.info("Telegram bot shut down successfully")

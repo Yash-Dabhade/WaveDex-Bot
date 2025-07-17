@@ -3,9 +3,9 @@ from loguru import logger
 from decimal import Decimal
 from datetime import datetime
 
-from app.services.prisma_service import prisma_service
+from app.core.db import db
 from app.services.coingecko_service import coingecko_service
-from app.services.coinmarketcap_service import coinmarketcap_service
+
 from app.models.schemas import Portfolio, MarketData
 
 class PortfolioService:
@@ -25,7 +25,12 @@ class PortfolioService:
         """Get user's portfolio with current market data"""
         try:
             # Get portfolio entries
-            portfolio_entries = await prisma_service.get_user_portfolio(user_id)
+            portfolio_entries = await db.prisma.portfolio.find_many(
+                where={"userId": user_id},
+                include={
+                    "transactions": True
+                }
+            )
             
             # Get current market data for all symbols
             result = []
@@ -76,40 +81,14 @@ class PortfolioService:
             # Try CoinGecko first
             market_data = await coingecko_service.get_price(symbol)
             
-            # If CoinGecko fails, try getting data from CoinMarketCap
-            if not market_data:
-                try:
-                    # Get current listings from cache if available
-                    cache_key = "cmc_listings"
-                    cached_listings = await coinmarketcap_service.cache.get_key(cache_key)
-                    
-                    if not cached_listings:
-                        # Fetch fresh listings
-                        listings = await coinmarketcap_service.get_trending_coins(limit=5000)
-                        await coinmarketcap_service.cache.set_key(cache_key, listings, expiry=600)
-                        cached_listings = listings
-                    
-                    # Find the coin in listings
-                    coin = next((c for c in cached_listings if c["symbol"] == symbol), None)
-                    if coin:
-                        market_data = MarketData(
-                            symbol=symbol,
-                            price=coin["price"],
-                            price_change_24h=coin["percent_change_24h"],
-                            market_cap=coin["market_cap"],
-                            volume_24h=coin["volume_24h"],
-                            high_24h=coin["price"] * (1 + coin["percent_change_24h"]/100),
-                            low_24h=coin["price"] * (1 - coin["percent_change_24h"]/100),
-                            last_updated=datetime.fromtimestamp(coin["last_updated"])
-                        )
-                except Exception as e:
-                    logger.error(f"Error fetching CMC data for {symbol}: {e}")
-            
             if not market_data:
                 raise ValueError(f"Invalid symbol: {symbol}")
 
             # Get existing position
-            portfolio = await prisma_service.get_user_portfolio(user_id)
+            portfolio = await db.prisma.portfolio.find_many(
+                where={"userId": user_id},
+                include={"transactions": True}
+            )
             existing = next(
                 (p for p in portfolio if p["symbol"] == symbol),
                 None
@@ -126,7 +105,7 @@ class PortfolioService:
                 total_value = (old_quantity * old_avg_price) + (new_quantity * new_price)
                 new_avg_price = total_value / total_quantity if total_quantity > 0 else Decimal('0')
 
-                updated = await prisma_service.update_portfolio(
+                updated = await db.prisma.portfolio.update_many(
                     user_id=user_id,
                     symbol=symbol,
                     quantity=float(total_quantity),
@@ -135,7 +114,7 @@ class PortfolioService:
                 return Portfolio.from_orm(updated)
             else:
                 # Create new position
-                created = await prisma_service.update_portfolio(
+                created = await db.prisma.portfolio.create(
                     user_id=user_id,
                     symbol=symbol,
                     quantity=quantity,
@@ -156,7 +135,10 @@ class PortfolioService:
         """Remove quantity from portfolio position"""
         try:
             # Get existing position
-            portfolio = await prisma_service.get_user_portfolio(user_id)
+            portfolio = await db.prisma.portfolio.find_many(
+                where={"userId": user_id},
+                include={"transactions": True}
+            )
             existing = next(
                 (p for p in portfolio if p["symbol"] == symbol.upper()),
                 None
@@ -175,14 +157,14 @@ class PortfolioService:
 
             if new_quantity == 0:
                 # Delete position if quantity becomes 0
-                await prisma_service.delete_portfolio(
+                await db.prisma.portfolio.delete_many(
                     user_id=user_id,
                     symbol=symbol
                 )
                 return None
             else:
                 # Update position with new quantity
-                updated = await prisma_service.update_portfolio(
+                updated = await db.prisma.portfolio.update_many(
                     user_id=user_id,
                     symbol=symbol,
                     quantity=float(new_quantity),
@@ -236,7 +218,10 @@ class PortfolioService:
         """Get performance data for watchlisted coins"""
         try:
             # Get portfolio entries
-            portfolio_entries = await prisma_service.get_user_portfolio(user_id)
+            portfolio_entries = await db.prisma.portfolio.find_many(
+                where={"userId": user_id},
+                include={"transactions": True}
+            )
             
             # Get current market data for all symbols
             result = []
@@ -266,13 +251,24 @@ class PortfolioService:
     async def get_trending_coins(self, limit: int = 10) -> List[Dict]:
         """Get top trending coins by price change"""
         try:
-            # Get trending coins from CoinMarketCap
-            trending = await coinmarketcap_service.get_trending_coins(limit=limit)
+            # Get trending coins from CoinGecko
+            trending = await coingecko_service.get_trending_coins(limit=limit)
+            
+            # Format to match expected output
+            formatted_trending = [{
+                "symbol": coin["symbol"].upper(),
+                "name": coin["name"],
+                "price": coin["current_price"],
+                "percent_change_24h": coin["price_change_percentage_24h"],
+                "market_cap": coin["market_cap"],
+                "volume_24h": coin["total_volume"],
+                "last_updated": int(datetime.now().timestamp())
+            } for coin in trending]
             
             # Sort by absolute percent change to show both top gainers and losers
-            trending.sort(key=lambda x: abs(x["percent_change_24h"]), reverse=True)
+            formatted_trending.sort(key=lambda x: abs(x["percent_change_24h"]), reverse=True)
             
-            return trending[:limit]
+            return formatted_trending[:limit]
 
         except Exception as e:
             logger.error(f"Error getting trending coins: {e}")

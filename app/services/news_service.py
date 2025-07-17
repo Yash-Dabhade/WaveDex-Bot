@@ -1,20 +1,29 @@
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Union
 import httpx
 from datetime import datetime, timedelta
 from loguru import logger
 import aiohttp
+import random
+import json
 
-from app.core.config import settings
+from env import env
 from app.models.schemas import NewsItem
 from app.services.cache_service import CacheService
 
 class NewsService:
     _instance: Optional['NewsService'] = None
     _initialized: bool = False
-    NEWS_API_BASE_URL = "https://newsapi.org/v2"
-    CRYPTOPANIC_BASE_URL = "https://cryptopanic.com/api/v1"
-    NEWS_CACHE_TTL = 3600  # 1 hour
-
+    
+    # API Endpoints
+    COINDESK_BASE_URL = "https://api.coindesk.com/v2"
+    CRYPTOCOMPARE_BASE_URL = "https://min-api.cryptocompare.com/data/v2"
+    
+    # Cache settings
+    NEWS_CACHE_TTL = 60  # 1 minute
+    
+    # Service flags
+    use_coindesk: bool = True
+    
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super(NewsService, cls).__new__(cls)
@@ -22,26 +31,8 @@ class NewsService:
 
     def __init__(self):
         if not self._initialized:
-            self.news_api_key = settings.NEWS_API_KEY
-            self.cryptopanic_api_key = settings.CRYPTOPANIC_API_KEY
             self.cache = CacheService()
-            
-            # Initialize HTTP clients
-            self.news_api_client = httpx.AsyncClient(
-                base_url=self.NEWS_API_BASE_URL,
-                timeout=30.0,
-                headers={"X-Api-Key": self.news_api_key}
-            )
-            
-            self.cryptopanic_client = httpx.AsyncClient(
-                base_url=self.CRYPTOPANIC_BASE_URL,
-                timeout=30.0,
-                params={"auth_token": self.cryptopanic_api_key}
-            )
-            
-            self.base_url = self.CRYPTOPANIC_BASE_URL
             self.session: Optional[aiohttp.ClientSession] = None
-            
             self._initialized = True
 
     async def initialize(self):
@@ -50,189 +41,182 @@ class NewsService:
             self.session = aiohttp.ClientSession()
 
     async def close(self):
-        """Close HTTP clients and the HTTP session"""
-        await self.news_api_client.aclose()
-        await self.cryptopanic_client.aclose()
+        """Close the HTTP session"""
         if self.session:
             await self.session.close()
             self.session = None
 
-    async def get_news(self, symbol: str = None, limit: int = 5) -> Dict[str, Any]:
-        """Get latest crypto news, optionally filtered by currency"""
+    async def _fetch_news_data(self) -> List[Dict[str, Any]]:
+        """Fetch news data from the API"""
+        cache_key = "crypto_news_data"
+        
+        # Try to get from cache first
+        cached_data = await self.cache.get_key(cache_key)
+        if cached_data:
+            return cached_data
+            
         try:
             if not self.session:
                 await self.initialize()
-
-            # Build request parameters
-            params = {
-                "auth_token": self.cryptopanic_api_key,
-                "public": "true",
-                "kind": "news",
-                "limit": limit
-            }
-
-            if symbol:
-                params["currencies"] = symbol.upper()
-
-            # Make API request
-            async with self.session.get(f"{self.base_url}/posts/", params=params) as response:
-                if response.status == 429:
-                    return {"error": "Rate limit exceeded. Please try again later."}
-                elif response.status != 200:
-                    return {"error": "Failed to fetch news"}
-
-                data = await response.json()
-                
-                if "results" not in data or not data["results"]:
-                    return {"error": f"No news found{' for ' + symbol.upper() if symbol else ''}"} 
-
-                # Process and format news items
-                news_items = []
-                for item in data["results"]:
-                    # Convert UTC timestamp to relative time
-                    published_at = datetime.fromisoformat(item["published_at"].replace('Z', '+00:00'))
-                    time_diff = datetime.now(published_at.tzinfo) - published_at
-                    
-                    if time_diff < timedelta(hours=1):
-                        relative_time = f"{int(time_diff.total_seconds() / 60)}m ago"
-                    elif time_diff < timedelta(days=1):
-                        relative_time = f"{int(time_diff.total_seconds() / 3600)}h ago"
-                    else:
-                        relative_time = f"{time_diff.days}d ago"
-
-                    news_items.append({
-                        "title": item["title"],
-                        "url": item["url"],
-                        "source": item["source"]["title"],
-                        "published": relative_time
-                    })
-
-                return {
-                    "symbol": symbol.upper() if symbol else "All Crypto",
-                    "news": news_items
-                }
-
-        except Exception as e:
-            logger.error(f"Error fetching news: {e}")
-            return {"error": "Failed to fetch news"}
-
-    async def _fetch_from_news_api(self, symbol: str) -> List[NewsItem]:
-        """Fetch news from NewsAPI"""
-        try:
-            response = await self.news_api_client.get(
-                "/everything",
-                params={
-                    "q": f"cryptocurrency {symbol}",
-                    "language": "en",
-                    "sortBy": "publishedAt",
-                    "pageSize": 10
-                }
-            )
-            response.raise_for_status()
-            data = response.json()
-
-            return [
-                NewsItem(
-                    title=article["title"],
-                    content=article["description"],
-                    source=article["source"]["name"],
-                    url=article["url"],
-                    published_at=datetime.fromisoformat(article["publishedAt"].replace("Z", "+00:00"))
-                )
-                for article in data.get("articles", [])
-            ]
-
-        except Exception as e:
-            logger.error(f"Error fetching news from NewsAPI for {symbol}: {e}")
-            return []
-
-    async def _fetch_from_cryptopanic(self, symbol: str) -> List[NewsItem]:
-        """Fetch news from CryptoPanic"""
-        try:
-            response = await self.cryptopanic_client.get(
-                "/posts/",
-                params={
-                    "currencies": symbol,
-                    "kind": "news",
-                    "public": True
-                }
-            )
-            response.raise_for_status()
-            data = response.json()
-
-            return [
-                NewsItem(
-                    title=post["title"],
-                    content=post.get("metadata", {}).get("description", ""),
-                    source=post["source"]["title"],
-                    url=post["url"],
-                    sentiment=self._get_sentiment_score(post.get("votes", {})),
-                    published_at=datetime.fromisoformat(post["published_at"].replace("Z", "+00:00"))
-                )
-                for post in data.get("results", [])
-            ]
-
-        except Exception as e:
-            logger.error(f"Error fetching news from CryptoPanic for {symbol}: {e}")
-            return []
-
-    def _get_sentiment_score(self, votes: Dict) -> float:
-        """Calculate sentiment score from votes"""
-        positive = votes.get("positive", 0)
-        negative = votes.get("negative", 0)
-        total = positive + negative
-
-        if total == 0:
-            return 0.0
-
-        return (positive - negative) / total
-
-    async def get_trending_news(self) -> List[NewsItem]:
-        """Get trending crypto news"""
-        cache_key = "news:trending"
-        
-        # Try to get from cache
-        cached_news = await self.cache.get_key(cache_key)
-        if cached_news:
-            return [NewsItem(**item) for item in cached_news]
-
-        try:
-            # Fetch from CryptoPanic
-            response = await self.cryptopanic_client.get(
-                "/posts/",
-                params={
-                    "filter": "trending",
-                    "kind": "news",
-                    "public": True
-                }
-            )
-            response.raise_for_status()
-            data = response.json()
-
-            trending_news = [
-                NewsItem(
-                    title=post["title"],
-                    content=post.get("metadata", {}).get("description", ""),
-                    source=post["source"]["title"],
-                    url=post["url"],
-                    sentiment=self._get_sentiment_score(post.get("votes", {})),
-                    published_at=datetime.fromisoformat(post["published_at"].replace("Z", "+00:00"))
-                )
-                for post in data.get("results", [])
-            ]
-
+            
+            news_items = []
+            
+            # Try CoinDesk first if enabled and API key is available
+            if self.use_coindesk and env.COINDESK_API_KEY:
+                try:
+                    coindesk_news = await self._fetch_coindesk_news()
+                    if coindesk_news:
+                        news_items.extend(coindesk_news)
+                except Exception as e:
+                    logger.warning(f"Failed to fetch from CoinDesk: {e}")
+            
+            # Fall back to CryptoCompare if needed
+            if not news_items:
+                try:
+                    crypto_compare_news = await self._fetch_cryptocompare_news()
+                    if crypto_compare_news:
+                        news_items.extend(crypto_compare_news)
+                except Exception as e:
+                    logger.error(f"Failed to fetch from CryptoCompare: {e}")
+            
             # Cache the results
-            await self.cache.set_key(
-                cache_key,
-                [news.dict() for news in trending_news],
-                expiry=self.NEWS_CACHE_TTL
-            )
-
-            return trending_news
-
+            if news_items:
+                await self.cache.set_key(cache_key, news_items, expiry=self.NEWS_CACHE_TTL)
+            
+            return news_items
+                
         except Exception as e:
-            logger.error(f"Error fetching trending news: {e}")
+            logger.error(f"Error fetching news data: {e}")
             return []
+            
+    async def _fetch_coindesk_news(self) -> List[Dict[str, Any]]:
+        """Fetch news from CoinDesk API"""
+        url = f"{self.COINDESK_BASE_URL}/news/btc-macro/1"
+        headers = {
+            "accept": "application/json",
+            "x-bloomburg": "false"
+        }
+        
+        if env.COINDESK_API_KEY:
+            headers["Authorization"] = f"Bearer {env.COINDESK_API_KEY}"
+        
+        async with self.session.get(url, headers=headers) as response:
+            if response.status != 200:
+                logger.error(f"CoinDesk API error: {response.status}")
+                return []
+                
+            data = await response.json()
+            articles = data.get("data", {}).get("news", [])
+            
+            return [{
+                "title": article.get("title", ""),
+                "source": "CoinDesk",
+                "url": article.get("url", ""),
+                "imageurl": article.get("thumbnail", ""),
+                "body": article.get("description", ""),
+                "source_info": {"name": "CoinDesk"},
+                "published_on": int(datetime.fromisoformat(article.get("publishedAt", "").replace("Z", "+00:00")).timestamp())
+            } for article in articles]
+    
+    async def _fetch_cryptocompare_news(self) -> List[Dict[str, Any]]:
+        """Fetch news from CryptoCompare API"""
+        url = f"{self.CRYPTOCOMPARE_BASE_URL}/news/"
+        
+        async with self.session.get(url) as response:
+            if response.status != 200:
+                logger.error(f"CryptoCompare API error: {response.status}")
+                return []
+                
+            data = await response.json()
+            if data.get("Type") == 100 and "Data" in data:
+                return data["Data"]
+            return []
+
+    async def get_headlines(self, limit: int = 5) -> List[Dict[str, str]]:
+        """
+        Get top headlines with source and URL
+        
+        Args:
+            limit: Number of headlines to return (default: 5)
+            
+        Returns:
+            List of dicts with title, source, and url
+        """
+        try:
+            news_data = await self._fetch_news_data()
+            if not news_data:
+                return []
+                
+            headlines = []
+            for item in news_data[:limit]:
+                headlines.append({
+                    "title": item.get("title", ""),
+                    "source": item.get("source_info", {}).get("name", "Unknown"),
+                    "url": item.get("url", "#")
+                })
+                
+            return headlines
+            
+        except Exception as e:
+            logger.error(f"Error getting headlines: {e}")
+            return []
+
+    async def get_news(self, limit: int = 3) -> List[Dict[str, Any]]:
+        """
+        Get detailed news with image and short description
+        
+        Args:
+            limit: Number of news items to return (default: 3)
+            
+        Returns:
+            List of dicts with title, source, url, image, and description
+        """
+        try:
+            news_data = await self._fetch_news_data()
+            if not news_data:
+                return []
+                
+            # Shuffle and pick top items to get variety
+            shuffled_news = random.sample(news_data, min(limit * 2, len(news_data)))
+            
+            news_items = []
+            for item in shuffled_news[:limit]:
+                # Get first 2-3 sentences from the body
+                body = item.get("body", "")
+                sentences = [s.strip() for s in body.split('.') if s.strip()]
+                short_description = '. '.join(sentences[:3]) + ('.' if len(sentences) > 3 else '')
+                
+                news_items.append({
+                    "title": item.get("title", ""),
+                    "source": item.get("source_info", {}).get("name", "Unknown"),
+                    "url": item.get("url", "#"),
+                    "image": item.get("imageurl", ""),
+                    "description": short_description
+                })
+                
+            return news_items
+            
+        except Exception as e:
+            logger.error(f"Error getting news: {e}")
+            return []
+
+    async def get_trending_news(self) -> List[Dict[str, Any]]:
+        """
+        Get trending crypto news (compatibility method)
+        
+        Returns:
+            List of dicts with title, source, and url
+        """
+        headlines = await self.get_headlines(limit=5)
+        return [
+            {
+                "title": item["title"],
+                "source": item["source"],
+                "url": item["url"],
+                "published_at": datetime.utcnow()
+            }
+            for item in headlines
+        ]
 
 # Create singleton instance
 news_service = NewsService() 

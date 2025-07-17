@@ -1,11 +1,11 @@
 from typing import List, Dict, Optional, Any
 from loguru import logger
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 import time
 
-from app.services.prisma_service import prisma_service
+from app.core.db import db
 from app.services.coingecko_service import coingecko_service
 from app.services.cache_service import CacheService
 from app.models.schemas import Alert, AlertCondition, MarketData
@@ -82,14 +82,13 @@ class AlertService:
     async def _get_active_alerts(self) -> List[Alert]:
         """Get all active alerts from database"""
         try:
-            async with prisma_service.get_connection() as db:
-                alerts = await db.alert.find_many(
-                    where={"isActive": True},
-                    include={
-                        "user": True
-                    }
-                )
-                return [Alert.from_orm(alert) for alert in alerts]
+            alerts = await db.prisma.alert.find_many(
+                where={"isActive": True},
+                include={
+                    "user": True
+                }
+            )
+            return [Alert.from_orm(alert) for alert in alerts]
         except Exception as e:
             logger.error(f"Error fetching active alerts: {e}")
             return []
@@ -158,8 +157,8 @@ class AlertService:
             )
 
             # Deactivate alert
-            async with prisma_service.get_connection() as db:
-                await db.alert.update(
+            async with db.session() as session:
+                await db.prisma.alert.update(
                     where={"id": alert.id},
                     data={"isActive": False}
                 )
@@ -172,11 +171,16 @@ class AlertService:
     async def create_alert(self, user_id: str, symbol: str, price: float, condition: str) -> Alert:
         """Create a new price alert"""
         try:
-            alert = await prisma_service.create_alert(
-                user_id=user_id,
-                symbol=symbol,
-                price_threshold=price,
-                condition=condition
+            alert = await db.prisma.alert.create(
+                data={
+                    "userId": user_id,
+                    "symbol": symbol.upper(),
+                    "priceThreshold": price,
+                    "condition": condition,
+                    "isActive": True,
+                    "createdAt": datetime.now(timezone.utc),
+                    "updatedAt": datetime.now(timezone.utc)
+                }
             )
             return Alert.from_orm(alert)
         except Exception as e:

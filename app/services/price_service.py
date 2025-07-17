@@ -3,7 +3,7 @@ import aiohttp
 from loguru import logger
 from datetime import datetime, timedelta
 
-from app.core.config import settings
+from env import env
 
 class PriceService:
     def __init__(self):

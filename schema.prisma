@@ -24,6 +24,24 @@ model User {
   portfolio         Portfolio[]
 }
 
+model Coin {
+  id                        Int       @id @default(autoincrement())
+  coin_id                   String    @unique
+  symbol                    String
+  name                      String
+  current_price             Float?
+  price_change_percentage_24h Float?
+  market_cap                Float?
+  total_volume              Float?
+  image                     String?
+  last_updated              DateTime
+  created_at                DateTime  @default(now())
+  updated_at                DateTime  @updatedAt
+
+  @@index([symbol])
+  @@index([market_cap])
+}
+
 model Alert {
   id              String    @id @default(uuid())
   userId          String

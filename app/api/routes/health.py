@@ -2,6 +2,8 @@ from fastapi import APIRouter, Response
 from loguru import logger
 from typing import Dict
 
+from app.core.db import db
+
 router = APIRouter()
 
 @router.get("")
@@ -16,8 +18,8 @@ async def health_check() -> Dict:
 
     try:
         # Check database connection
-        await prisma_service.connect()
-        await prisma_service.disconnect()
+        await db.connect()
+        await db.disconnect()
         status["services"]["database"] = "healthy"
     except Exception as e:
         logger.error(f"Database health check failed: {e}")
