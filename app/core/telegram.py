@@ -12,7 +12,6 @@ from app.services.price_service import price_service
 from app.services.news_service import news_service
 from app.services.alert_service import alert_service
 from app.services.notification_service import notification_service
-from app.services.portfolio_service import portfolio_service
 from app.core.db import db
 from app.services.coin_service import coin_service
 
@@ -109,15 +108,11 @@ class TelegramBot:
             ("price", "Get current price for a coin", self._price_command),
             ("coins", "List supported coins", self._coins_command),
             ("history", "View price history", self._price_history_command),
-            ("trending", "Show trending coins", self._trending_command),
             ("headlines", "Get top 5 crypto headlines", self._headlines_command),
             ("news", "Get latest crypto news with images and descriptions", self._news_command),
             ("setalert", "Set price alert", self._set_alert_command),
             ("alerts", "View your active alerts", self._list_alerts_command),
-            ("delalert", "Delete an alert", self._delete_alert_command),
-            ("portfolio", "View your portfolio", self._portfolio_command),
-            ("add", "Add position to portfolio", self._add_position_command),
-            ("remove", "Remove position from portfolio", self._remove_position_command),
+            ("delalert", "Delete an alert", self._delete_alert_command)
         ]
 
         # Register command handlers
@@ -152,11 +147,6 @@ class TelegramBot:
             "/price [symbol] - Current price & stats\n"
             "/coins - List supported coins\n"
             "/history [symbol] [days] - Price history\n"
-            "/trending - Top movers\n\n"
-            "📈 Portfolio\n"
-            "/portfolio - View your portfolio\n"
-            "/add [symbol] [quantity] [price] - Add position\n"
-            "/remove [symbol] [quantity] - Remove position\n\n"
             "⚡️ Alerts\n"
             "/alert [symbol] [price] [above/below] - Set alert\n"
             "/alerts - View your alerts\n"
@@ -240,9 +230,6 @@ class TelegramBot:
             keyboard = [
                 [
                     InlineKeyboardButton("📈 View History", callback_data=f"history_{symbol}_7"),
-                ],
-                [
-                    InlineKeyboardButton("🔔 Set Price Alert", callback_data=f"alert_{symbol}"),
                 ],
                 [
                     InlineKeyboardButton("❌ Close", callback_data="close")
@@ -693,7 +680,7 @@ class TelegramBot:
                 await update.message.reply_text(
                     caption,
                     parse_mode='HTML',
-                    link_preview_options={"is_disabled": False}
+                    disable_web_page_preview=False
                 )
 
         except Exception as e:
@@ -723,7 +710,7 @@ class TelegramBot:
             await update.message.reply_text(
                 '\n\n'.join(message),
                 parse_mode='HTML',
-                link_preview_options={"is_disabled": True}
+                disable_web_page_preview=True
             )
             
         except Exception as e:
@@ -731,26 +718,61 @@ class TelegramBot:
             await update.message.reply_text("❌ Failed to fetch headlines. Please try again later.")
 
     async def _set_alert_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /alert command"""
+        """Handle /setalert command with improved validation and feedback"""
+        loading_msg = await update.message.reply_text("⏳ Setting up your alert...")
+        
         try:
+            # Show help if no arguments provided
             if not context.args or len(context.args) < 3:
+                help_text = (
+                    "🔔 *Set Price Alert* 🔔\n\n"
+                    "*Usage:* `/setalert <symbol> <price> <above|below>`\n"
+                    "*Example:* `/setalert BTC 50000 above`\n\n"
+                    "*Parameters:*\n"
+                    "• `<symbol>` - Cryptocurrency symbol (e.g., BTC, ETH)\n"
+                    "• `<price>` - Target price to be notified at\n"
+                    "• `<above|below>` - Whether to alert when price goes above or below the target\n\n"
+                    "*Example Usage:*\n"
+                    "• `/setalert BTC 50000 above` - Alert when BTC goes above $50,000\n"
+                    "• `/setalert ETH 2000 below` - Alert when ETH drops below $2,000"
+                )
+                await self._delete_message_safe(loading_msg)
                 await update.message.reply_text(
-                    "Please provide symbol, price, and condition (above/below).\n"
-                    "Example: /alert btc 50000 above"
+                    help_text,
+                    parse_mode=ParseMode.MARKDOWN,
+                    disable_web_page_preview=True
                 )
                 return
 
-            loading_msg = await self._send_loading_message(update)
-
-            symbol = context.args[0].lower()
+            # Parse and validate input
+            symbol = context.args[0].upper()
             try:
-                price = float(context.args[1])
+                price = float(context.args[1].replace(',', ''))
+                if price <= 0:
+                    raise ValueError("Price must be greater than 0")
                 condition = context.args[2].lower()
-            except ValueError:
+                if condition not in ['above', 'below']:
+                    raise ValueError("Invalid condition")
+            except ValueError as e:
+                error_msg = ""
+                if "could not convert string to float" in str(e):
+                    error_msg = "❌ Invalid price format. Please enter a valid number."
+                elif "Price must be greater than 0" in str(e):
+                    error_msg = "❌ Price must be greater than 0."
+                elif "Invalid condition" in str(e):
+                    error_msg = "❌ Condition must be either 'above' or 'below'."
+                else:
+                    error_msg = "❌ Invalid input. Please check your values and try again."
+                
                 await self._delete_message_safe(loading_msg)
-                await update.message.reply_text("❌ Invalid price value")
+                await update.message.reply_text(
+                    f"{error_msg}\n\n"
+                    "*Example:* `/setalert BTC 50000 above`",
+                    parse_mode=ParseMode.MARKDOWN
+                )
                 return
 
+            # Set the alert
             result = await alert_service.set_alert(
                 user_id=update.effective_user.id,
                 symbol=symbol,
@@ -758,102 +780,255 @@ class TelegramBot:
                 condition=condition
             )
 
-            await self._delete_message_safe(loading_msg)
-
-            if "error" in result:
-                await update.message.reply_text(f"❌ {result['error']}")
+            # Handle response
+            if 'error' in result:
+                error_msg = result['error']
+                if 'duplicate' in error_msg.lower():
+                    response = "ℹ️ You already have a similar alert set."
+                else:
+                    response = f"❌ {error_msg}"
+                
+                await self._delete_message_safe(loading_msg)
+                await update.message.reply_text(
+                    response,
+                    parse_mode=ParseMode.MARKDOWN
+                )
             else:
-                await update.message.reply_text(result["message"])
-
+                # Get current price for feedback
+                current_price = await price_service.get_current_price(symbol)
+                price_diff = ((current_price - price) / price * 100) if current_price else 0
+                
+                response = (
+                    f"✅ *Alert Set Successfully* ✅\n\n"
+                    f"• *Symbol:* {symbol}\n"
+                    f"• *Condition:* Price {condition.upper()} ${price:,.2f}\n"
+                    f"• *Current Price:* ${current_price:,.2f} ({price_diff:+.2f}%)"
+                )
+                
+                await self._delete_message_safe(loading_msg)
+                await update.message.reply_text(
+                    response,
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                
         except Exception as e:
-            logger.error(f"Error in alert command: {e}")
+            logger.error(f"Error in set_alert_command: {e}")
             await self._delete_message_safe(loading_msg)
-            await update.message.reply_text("❌ Failed to set alert. Please try again later.")
+            await update.message.reply_text(
+                "❌ An error occurred while setting the alert. Please try again.",
+                parse_mode=ParseMode.MARKDOWN
+            )
 
     async def _list_alerts_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /alerts command"""
+        """Handle /alerts command with improved formatting and current prices"""
+        loading_msg = await update.message.reply_text("⏳ Fetching your alerts...")
+        
         try:
-            loading_msg = await self._send_loading_message(update)
-
+            # Get user's alerts
             alerts = await alert_service.get_user_alerts(update.effective_user.id)
             
-            await self._delete_message_safe(loading_msg)
-
             if not alerts:
-                await update.message.reply_text("You don't have any active alerts.")
-                return
-
-            message = "🔔 Your Active Alerts:\n\n"
-            for alert in alerts:
-                # Calculate price difference
-                diff = ((alert["current_price"] - alert["target_price"]) / alert["target_price"]) * 100
-                
-                message += (
-                    f"ID: {alert['id']}\n"
-                    f"Symbol: {alert['symbol']}\n"
-                    f"Target: ${alert['target_price']:,.2f} ({alert['condition']})\n"
-                    f"Current: ${alert['current_price']:,.2f} ({diff:+.2f}%)\n"
-                    f"Created: {datetime.fromtimestamp(alert['created_at']).strftime('%Y-%m-%d %H:%M:%S')}\n"
-                    f"---------------\n"
+                no_alerts_msg = (
+                    "🔕 *No Active Alerts*\n\n"
+                    "You don't have any active price alerts.\n"
+                    "Use `/setalert <symbol> <price> <above|below>` to create one!"
                 )
-
-            await update.message.reply_text(message)
-
+                await update.message.reply_text(
+                    no_alerts_msg,
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                return
+            
+            # Get unique symbols to fetch current prices
+            symbols = list({alert['symbol'].upper() for alert in alerts})
+            current_prices = await price_service.get_prices(symbols)
+            
+            # Format alerts with current prices
+            alert_messages = []
+            for alert in alerts:
+                symbol = alert['symbol'].upper()
+                current_price = current_prices.get(symbol, {}).get('price', alert.get('current_price', 0))
+                target_price = alert['target_price']
+                price_diff = ((current_price - target_price) / target_price * 100) if target_price else 0
+                
+                # Determine alert status emoji
+                status_emoji = "🟢"  # Default: alert not triggered
+                if alert.get('triggered'):
+                    status_emoji = "🔴"  # Alert triggered
+                
+                # Create progress bar (20 characters wide)
+                progress = min(1.0, max(0.0, current_price / (target_price * 1.5)))
+                progress_bar = "█" * int(progress * 20)
+                progress_bar = progress_bar.ljust(20, "░")
+                
+                # Format alert message
+                alert_msg = (
+                    f"{status_emoji} *{symbol}*\n"
+                    f"`{progress_bar}`\n"
+                    f"• Target: ${target_price:,.2f} ({alert['condition']})\n"
+                    f"• Current: ${current_price:,.2f} ({price_diff:+.2f}%)"
+                )
+                
+                # Add alert ID for reference
+                alert_msg += f"\n• ID: `{alert['id']}`"
+                
+                alert_messages.append(alert_msg)
+            
+            # Create paginated messages (max 5 alerts per message)
+            max_alerts_per_message = 5
+            for i in range(0, len(alert_messages), max_alerts_per_message):
+                chunk = alert_messages[i:i + max_alerts_per_message]
+                message = "🔔 *Your Alerts* 🔔\n\n"
+                message += "\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n".join(chunk)
+                
+                # Add footer to the last message
+                if i + max_alerts_per_message >= len(alert_messages):
+                    message += "\n\nUse `/delalert <id>` to remove an alert."
+                
+                await update.message.reply_text(
+                    message,
+                    parse_mode=ParseMode.MARKDOWN,
+                    disable_web_page_preview=True
+                )
+                
         except Exception as e:
             logger.error(f"Error in alerts command: {e}")
+            await update.message.reply_text(
+                "❌ Failed to fetch alerts. Please try again later.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        finally:
             await self._delete_message_safe(loading_msg)
-            await update.message.reply_text("❌ Failed to fetch alerts. Please try again later.")
 
     async def _delete_alert_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /delalert command"""
+        """Handle /delalert command with improved feedback and confirmation"""
+        loading_msg = await update.message.reply_text("⏳ Processing your request...")
+        
         try:
+            # Validate command arguments
             if not context.args:
-                await update.message.reply_text(
-                    "Please provide the alert ID.\n"
-                    "Use /alerts to see your active alerts and their IDs"
+                help_text = (
+                    "🗑 *Delete Alert* 🗑\n\n"
+                    "*Usage:* `/delalert <alert_id>`\n"
+                    "*Example:* `/delalert 12345`\n\n"
+                    "Use `/alerts` to see your active alerts and their IDs."
                 )
+                await update.message.reply_text(
+                    help_text,
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                await self._delete_message_safe(loading_msg)
                 return
-
-            loading_msg = await self._send_loading_message(update)
-
+                
             alert_id = context.args[0]
+            
+            # First, get the alert details to show what's being deleted
+            alerts = await alert_service.get_user_alerts(update.effective_user.id)
+            alert_to_delete = next((a for a in alerts if str(a['id']) == alert_id), None)
+            
+            if not alert_to_delete:
+                await update.message.reply_text(
+                    "❌ Alert not found. Please check the alert ID and try again.\n"
+                    "Use `/alerts` to see your active alerts.",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                await self._delete_message_safe(loading_msg)
+                return
+            
+            # Delete the alert
             result = await alert_service.delete_alert(
                 user_id=update.effective_user.id,
                 alert_id=alert_id
             )
-
-            await self._delete_message_safe(loading_msg)
-
-            if "error" in result:
-                await update.message.reply_text(f"❌ {result['error']}")
+            
+            if 'error' in result:
+                await update.message.reply_text(
+                    f"❌ {result['error']}",
+                    parse_mode=ParseMode.MARKDOWN
+                )
             else:
-                await update.message.reply_text(result["message"])
-
+                # Format success message with alert details
+                symbol = alert_to_delete['symbol'].upper()
+                target_price = alert_to_delete['target_price']
+                condition = alert_to_delete['condition']
+                
+                success_msg = (
+                    f"🗑 *Alert Deleted* ✅\n\n"
+                    f"• *Symbol:* {symbol}\n"
+                    f"• *Condition:* Price {condition.upper()} ${target_price:,.2f}\n"
+                    f"• *Alert ID:* `{alert_id}`"
+                )
+                
+                await update.message.reply_text(
+                    success_msg,
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                
         except Exception as e:
             logger.error(f"Error in delalert command: {e}")
+            await update.message.reply_text(
+                "❌ Failed to delete alert. Please try again later.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        finally:
             await self._delete_message_safe(loading_msg)
-            await update.message.reply_text("❌ Failed to delete alert. Please try again later.")
 
     async def _check_alerts_loop(self):
-        """Periodically check alerts in background"""
+        """Periodically check alerts in background with improved notification formatting"""
         while True:
             try:
                 triggered_alerts = await alert_service.check_alerts()
                 
-                # Send notifications for triggered alerts
+                # Process notifications in parallel
+                tasks = []
                 for alert in triggered_alerts:
+                    symbol = alert['symbol'].upper()
+                    target_price = alert['target_price']
+                    current_price = alert['current_price']
+                    price_diff = ((current_price - target_price) / target_price * 100)
+                    condition = alert['condition']
+                    
+                    # Get additional price data if available
+                    change_24h = alert.get('price_data', {}).get('change_24h', 0)
+                    high_24h = alert.get('price_data', {}).get('high_24h', 0)
+                    low_24h = alert.get('price_data', {}).get('low_24h', 0)
+                    
+                    # Determine direction emoji and status
+                    direction_emoji = '📈' if condition == 'above' else '📉'
+                    status_emoji = '🎯'  # Default status emoji
+                    
+                    # Format the alert message with markdown
                     message = (
-                        f"🚨 Price Alert for {alert['symbol']}!\n\n"
-                        f"Target: ${alert['target_price']:,.2f} ({alert['condition']})\n"
-                        f"Current Price: ${alert['current_price']:,.2f}\n"
-                        f"24h Change: {alert['price_data']['change_24h']:+.2f}%\n\n"
-                        f"Use /alerts to manage your alerts"
+                        f"{direction_emoji} *PRICE ALERT* {direction_emoji}\n\n"
+                        f"• *{symbol}* is now *{condition.upper()}* your target price!\n\n"
+                        f"🎯 *Target:* ${target_price:,.2f} ({condition})\n"
+                        f"💰 *Current:* ${current_price:,.2f} ({price_diff:+.2f}%)"
                     )
                     
-                    await notification_service.send_message(
-                        chat_id=alert['user_id'],
-                        text=message
+                    # Add 24h stats if available
+                    if high_24h or low_24h:
+                        message += (
+                            f"\n\n📊 *24h Stats:*\n"
+                            f"• High: ${high_24h:,.2f}\n"
+                            f"• Low: ${low_24h:,.2f}\n"
+                            f"• Change: {change_24h:+.2f}%"
+                        )
+                    
+                    # Add action buttons
+                    message += "\n\n🔔 Use /alerts to manage your alerts"
+                    
+                    # Send the notification
+                    tasks.append(
+                        notification_service.send_message(
+                            chat_id=alert['user_id'],
+                            text=message,
+                            parse_mode=ParseMode.MARKDOWN
+                        )
                     )
+                
+                # Send all notifications in parallel
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
                 
                 # Wait for 1 minute before next check
                 await asyncio.sleep(60)
